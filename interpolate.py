@@ -35,14 +35,12 @@ def getFramesCout():
 parser = argparse.ArgumentParser(description='Interpolation for a pair of images')
 parser.add_argument('-i', dest='input_video_name', required=True, type=str, default=None)
 parser.add_argument('-o', dest='output_video_name', type=str, default=None)
-parser.add_argument('--montage', dest='montage', action='store_true',
-                    help='compare side by side origin and interpolated video')
 parser.add_argument('--fp16', dest='fp16', action='store_true',
                     help='fp16 mode for faster and more lightweight inference on cards with Tensor Cores')
-parser.add_argument('--UHD', dest='UHD', action='store_true', help='support 4k video')
-parser.add_argument('--scale', dest='scale', type=float, default=1.0, choices=[0.25, 0.5, 1.0, 2.0, 4.0],
+parser.add_argument('-U', dest='UHD', action='store_true', help='support 4k video')
+parser.add_argument('-s', dest='scale', type=float, default=1.0, choices=[0.25, 0.5, 1.0, 2.0, 4.0],
                     help='Try scale=0.5 for 4k video')
-parser.add_argument('--multi', dest='multi', type=int, default=2)
+parser.add_argument('-x', dest='multi', type=int, default=2)
 args = parser.parse_args()
 
 # https://gist.github.com/oldo/dc7ee7f28851922cca09
@@ -151,16 +149,10 @@ pbar = tqdm(total=total_frames, desc="interpol", position=0)
 last_frame = read_buffer.get()
 pbar.update(1)
 
-w = width
-h = height
-if args.montage:
-    left = w // 4
-    w = w // 2
-    last_frame = last_frame[:, left: left + w]
 tmp = max(128, int(128 / args.scale))
-ph = ((h - 1) // tmp + 1) * tmp
-pw = ((w - 1) // tmp + 1) * tmp
-padding = (0, pw - w, 0, ph - h)
+ph = ((height - 1) // tmp + 1) * tmp
+pw = ((width - 1) // tmp + 1) * tmp
+padding = (0, pw - width, 0, ph - height)
 I1 = torch.from_numpy(np.transpose(last_frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
 I1 = pad_image(I1)
 temp = None  # save last_frame when processing static frame
@@ -193,42 +185,24 @@ while True:
         I1 = model.inference(I0, I1, args.scale)
         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
-        frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
+        frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:height, :width]
 
     if ssim < 0.2:
         output = []
         for i in range(args.multi - 1):
             output.append(I0)
-        '''
-        output = []
-        step = 1 / args.multi
-        alpha = 0
-        for i in range(args.multi - 1):
-            alpha += step
-            beta = 1-alpha
-            output.append(torch.from_numpy(np.transpose((cv2.addWeighted(frame[:, :, ::-1], alpha, last_frame[:, :, ::-1], beta, 0)[:, :, ::-1].copy()), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.)
-        '''
     else:
         output = make_inference(I0, I1, args.multi - 1)
 
-    if args.montage:
-        write_buffer.put(np.concatenate((last_frame, last_frame), 1))
-        for mid in output:
-            mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
-            write_buffer.put(np.concatenate((last_frame, mid[:h, :w]), 1))
-    else:
-        write_buffer.put(last_frame)
-        for mid in output:
-            mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
-            write_buffer.put(mid[:h, :w])
+    write_buffer.put(last_frame)
+    for mid in output:
+        mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+        write_buffer.put(mid[:height, :width])
     pbar.update(1)
     last_frame = frame
     if break_flag:
         break
 
-if args.montage:
-    write_buffer.put(np.concatenate((last_frame, last_frame), 1))
-else:
-    write_buffer.put(last_frame)
+write_buffer.put(last_frame)
 # notify about finish of process
 write_buffer.put(None)
