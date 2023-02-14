@@ -3,7 +3,6 @@ import json
 import os
 import shlex
 import subprocess as sp
-import sys
 import threading
 import warnings
 from queue import Queue
@@ -26,7 +25,7 @@ def getFramesCout():
     ffmpegOutput = sp.check_output(command, stderr=sp.STDOUT).decode('utf-8')
     ffmpegOutput = ffmpegOutput.split('\r')
     for line in reversed(ffmpegOutput):
-        result = re.search('frame= (.*) fps', line)
+        result = re.search('frame=(.*)fps', line)
         if result is not None:
             return int(result.group(1))
     return None
@@ -41,12 +40,12 @@ parser.add_argument('-U', dest='UHD', action='store_true', help='support 4k vide
 parser.add_argument('-s', dest='scale', type=float, default=1.0, choices=[0.25, 0.5, 1.0, 2.0, 4.0],
                     help='Try scale=0.5 for 4k video')
 parser.add_argument('-x', dest='multi', type=int, default=2)
+parser.add_argument('-rbs', dest='rbs', type=int, default=20, help='read buffer size before interpolation')
+parser.add_argument('-wbs', dest='wbs', type=int, default=2000, help='write buffer size before encoding')
 args = parser.parse_args()
 
 # https://gist.github.com/oldo/dc7ee7f28851922cca09
-cmd = "ffprobe -v quiet -print_format json -show_streams -select_streams v:0"
-cmd = shlex.split(cmd)
-cmd.append(args.input_video_name)
+cmd = shlex.split(f"ffprobe -v quiet -print_format json -show_streams -select_streams v:0 {args.input_video_name}")
 # run the ffprobe process, decode stdout into utf-8 & convert to JSON
 ffprobeOutput = sp.check_output(cmd).decode('utf-8')
 # print(ffprobeOutput)
@@ -59,7 +58,7 @@ fps_target = fps_original * args.multi
 total_frames = getFramesCout()
 
 # setup input
-read_buffer = Queue(maxsize=100)
+read_buffer = Queue(maxsize=args.rbs)
 def reading_frames():
     command = shlex.split(f'ffmpeg -i {args.input_video_name} -f rawvideo -pix_fmt rgb24 -')
     input_pipe = sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL)
@@ -75,20 +74,20 @@ def reading_frames():
 threading.Thread(target=reading_frames).start()
 
 # setup output
-write_buffer = Queue(maxsize=1000)
+write_buffer = Queue(maxsize=args.wbs)
 def writting_frames():
     total_encoding_frames = total_frames * args.multi - (args.multi - 1)
     pbarenc = tqdm(total=total_encoding_frames, desc="encoding", position=1)
-    x265_params = "limit-sao:bframes=8:psy-rd=1.5:psy-rdoq=2:aq-mode=3"
     if args.output_video_name is None:
         video_path_wo_ext, ext = os.path.splitext(args.input_video_name)
         ext = ext[1:]
         args.output_video_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(fps_target)), ext)
-        command = shlex.split(f'ffmpeg -y -i {args.input_video_name} '
-                              f'-f rawvideo -s {width}x{height} -pixel_format rgb24 -r {fps_target} -i pipe: '
-                              '-map 0 -map -0:v -map 1:v '
-                              f'-c:v libx265 -x265-params "{x265_params}" -preset slow '
-                              f'-pix_fmt yuv420p10le -crf 23 {args.output_video_name}')
+    x265_params = "limit-sao:bframes=8:psy-rd=1.5:psy-rdoq=2:aq-mode=3"
+    command = shlex.split(f'ffmpeg -y -i {args.input_video_name} '
+                          f'-f rawvideo -s {width}x{height} -pixel_format rgb24 -r {fps_target} -i pipe: '
+                          '-map 0 -map -0:v -map 1:v '
+                          f'-c:v libx265 -x265-params "{x265_params}" -preset medium '
+                          f'-pix_fmt yuv420p10le -crf 23 {args.output_video_name}')
     output_pipe = sp.Popen(command, stdin=sp.PIPE, stderr=sp.DEVNULL)
     while True:
         item = write_buffer.get()
@@ -150,7 +149,7 @@ model.device()
 
 pbar = tqdm(total=total_frames, desc="interpol", position=0)
 last_frame = read_buffer.get()
-pbar.update(1)
+pbar.update()
 
 tmp = max(128, int(128 / args.scale))
 ph = ((height - 1) // tmp + 1) * tmp
@@ -161,51 +160,21 @@ I1 = pad_image(I1)
 temp = None  # save last_frame when processing static frame
 
 while True:
-    if temp is not None:
-        frame = temp
-        temp = None
-    else:
-        frame = read_buffer.get()
+    frame = read_buffer.get()
     if frame is None:
         break
     I0 = I1
     I1 = torch.from_numpy(np.transpose(frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
-    I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
-    I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-    ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
 
-    break_flag = False
-    if ssim > 0.996:
-        frame = read_buffer.get()  # read a new frame
-        if frame is None:
-            break_flag = True
-            frame = last_frame
-        else:
-            temp = frame
-        I1 = torch.from_numpy(np.transpose(frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-        I1 = pad_image(I1)
-        I1 = model.inference(I0, I1, args.scale)
-        I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-        ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
-        frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:height, :width]
-
-    if ssim < 0.2:
-        output = []
-        for i in range(args.multi - 1):
-            output.append(I0)
-    else:
-        output = make_inference(I0, I1, args.multi - 1)
-
+    output = make_inference(I0, I1, args.multi - 1)
     write_buffer.put(last_frame)
     for mid in output:
-        mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+        mid = ((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
         write_buffer.put(mid[:height, :width])
     pbar.update()
     last_frame = frame
-    if break_flag:
-        break
 
 write_buffer.put(last_frame)
-# notify about finish of process
+# notify about finish of interpolation process
 write_buffer.put(None)
