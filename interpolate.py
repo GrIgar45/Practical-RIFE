@@ -59,7 +59,7 @@ fps_target = fps_original * args.multi
 total_frames = getFramesCout()
 
 # setup input
-read_buffer = Queue(maxsize=50)
+read_buffer = Queue(maxsize=100)
 def reading_frames():
     command = shlex.split(f'ffmpeg -i {args.input_video_name} -f rawvideo -pix_fmt rgb24 -')
     input_pipe = sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL)
@@ -75,17 +75,20 @@ def reading_frames():
 threading.Thread(target=reading_frames).start()
 
 # setup output
-write_buffer = Queue(maxsize=3000)
+write_buffer = Queue(maxsize=1000)
 def writting_frames():
-    pbarenc = tqdm(total=total_frames * args.multi - 1, desc="encoding", position=1)
+    total_encoding_frames = total_frames * args.multi - (args.multi - 1)
+    pbarenc = tqdm(total=total_encoding_frames, desc="encoding", position=1)
     x265_params = "limit-sao:bframes=8:psy-rd=1.5:psy-rdoq=2:aq-mode=3"
     if args.output_video_name is None:
         video_path_wo_ext, ext = os.path.splitext(args.input_video_name)
         ext = ext[1:]
         args.output_video_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(fps_target)), ext)
-    command = shlex.split(f'ffmpeg -y -f rawvideo -s {width}x{height} -pixel_format rgb24 -r {fps_target} -i pipe:'
-                          f' -c:v libx265 -x265-params "{x265_params}" -preset slow'
-                          f' -pix_fmt yuv420p10le -crf 23 {args.output_video_name}')
+        command = shlex.split(f'ffmpeg -y -i {args.input_video_name} '
+                              f'-f rawvideo -s {width}x{height} -pixel_format rgb24 -r {fps_target} -i pipe: '
+                              '-map 0 -map -0:v -map 1:v '
+                              f'-c:v libx265 -x265-params "{x265_params}" -preset slow '
+                              f'-pix_fmt yuv420p10le -crf 23 {args.output_video_name}')
     output_pipe = sp.Popen(command, stdin=sp.PIPE, stderr=sp.DEVNULL)
     while True:
         item = write_buffer.get()
@@ -198,7 +201,7 @@ while True:
     for mid in output:
         mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
         write_buffer.put(mid[:height, :width])
-    pbar.update(1)
+    pbar.update()
     last_frame = frame
     if break_flag:
         break
