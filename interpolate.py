@@ -12,8 +12,6 @@ import torch
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from model.pytorch_msssim import ssim_matlab
-
 warnings.filterwarnings("ignore")
 
 
@@ -61,12 +59,12 @@ total_frames = getFramesCout()
 read_buffer = Queue(maxsize=args.rbs)
 def reading_frames():
     command = shlex.split(f'ffmpeg -i {args.input_video_name} -f rawvideo -pix_fmt rgb24 -')
-    input_pipe = sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL)
+    input_pipe = sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL, pipesize=1048576)
     while True:
         raw = input_pipe.stdout.read(height * width * 3)
         if not raw:
             break
-        read_buffer.put(np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3)))
+        read_buffer.put(raw)
 
     input_pipe.stdout.close()
     input_pipe.wait()
@@ -82,18 +80,18 @@ def writting_frames():
         video_path_wo_ext, ext = os.path.splitext(args.input_video_name)
         ext = ext[1:]
         args.output_video_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(fps_target)), ext)
-    x265_params = "limit-sao:bframes=8:psy-rd=1.5:psy-rdoq=2:aq-mode=3"
+    x265_params = "limit-sao=1:bframes=8:psy-rd=1.5:psy-rdoq=2:aq-mode=3"
     command = shlex.split(f'ffmpeg -y -i {args.input_video_name} '
                           f'-f rawvideo -s {width}x{height} -pixel_format rgb24 -r {fps_target} -i pipe: '
                           '-map 0 -map -0:v -map 1:v '
                           f'-c:v libx265 -x265-params "{x265_params}" -preset medium '
                           f'-pix_fmt yuv420p10le -crf 23 {args.output_video_name}')
-    output_pipe = sp.Popen(command, stdin=sp.PIPE, stderr=sp.DEVNULL)
+    output_pipe = sp.Popen(command, stdin=sp.PIPE, stderr=sp.DEVNULL, pipesize=1048576)
     while True:
         item = write_buffer.get()
         if item is None:
             break
-        output_pipe.stdin.write(item.tobytes())
+        output_pipe.stdin.write(item)
         pbarenc.update()
 
     output_pipe.stdin.close()
@@ -148,33 +146,34 @@ model.eval()
 model.device()
 
 pbar = tqdm(total=total_frames, desc="interpol", position=0)
-last_frame = read_buffer.get()
+raw_data = read_buffer.get()
+write_buffer.put(raw_data)
 pbar.update()
 
 tmp = max(128, int(128 / args.scale))
 ph = ((height - 1) // tmp + 1) * tmp
 pw = ((width - 1) // tmp + 1) * tmp
 padding = (0, pw - width, 0, ph - height)
-I1 = torch.from_numpy(np.transpose(last_frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+I1 = torch.from_numpy(np.transpose(np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 3)), (2, 0, 1))) \
+         .to(device, non_blocking=True).unsqueeze(0).float() / 255.
 I1 = pad_image(I1)
 temp = None  # save last_frame when processing static frame
 
 while True:
-    frame = read_buffer.get()
-    if frame is None:
+    raw_data = read_buffer.get()
+    if raw_data is None:
         break
     I0 = I1
-    I1 = torch.from_numpy(np.transpose(frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+    I1 = torch.from_numpy(np.transpose(np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 3)), (2, 0, 1))) \
+             .to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
 
     output = make_inference(I0, I1, args.multi - 1)
-    write_buffer.put(last_frame)
     for mid in output:
         mid = ((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
-        write_buffer.put(mid[:height, :width])
+        write_buffer.put(mid[:height, :width].tobytes())
+    write_buffer.put(raw_data)
     pbar.update()
-    last_frame = frame
 
-write_buffer.put(last_frame)
 # notify about finish of interpolation process
 write_buffer.put(None)
