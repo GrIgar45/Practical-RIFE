@@ -38,7 +38,6 @@ parser.add_argument('-U', dest='UHD', action='store_true', help='support 4k vide
 parser.add_argument('-s', dest='scale', type=float, default=1.0, choices=[0.25, 0.5, 1.0, 2.0, 4.0],
                     help='Try scale=0.5 for 4k video')
 parser.add_argument('-x', dest='multi', type=int, default=2)
-parser.add_argument('-rbs', dest='rbs', type=int, default=20, help='read buffer size before interpolation')
 parser.add_argument('-wbs', dest='wbs', type=int, default=2000, help='write buffer size before encoding')
 args = parser.parse_args()
 
@@ -55,27 +54,20 @@ fps_original = eval(ffprobeOutput['streams'][0]['r_frame_rate'])
 fps_target = fps_original * args.multi
 total_frames = getFramesCout()
 
-# setup input
-read_buffer = Queue(maxsize=args.rbs)
-def reading_frames():
-    command = shlex.split(f'ffmpeg -i {args.input_video_name} -f rawvideo -pix_fmt rgb24 -')
-    input_pipe = sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL, pipesize=1048576)
-    while True:
-        raw = input_pipe.stdout.read(height * width * 3)
-        if not raw:
-            break
-        read_buffer.put(raw)
+command = shlex.split(f'ffmpeg -i {args.input_video_name} -f rawvideo -pix_fmt rgb24 -')
+input_pipe = sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL, pipesize=1048576)
 
-    input_pipe.stdout.close()
-    input_pipe.wait()
-    read_buffer.put(None)
-threading.Thread(target=reading_frames).start()
+def read_raw():
+    raw = input_pipe.stdout.read(height * width * 3)
+    if not raw:
+        return None
+    return raw
 
 # setup output
 write_buffer = Queue(maxsize=args.wbs)
 def writting_frames():
     total_encoding_frames = total_frames * args.multi - (args.multi - 1)
-    pbarenc = tqdm(total=total_encoding_frames, desc="encoding", position=1)
+    pbarenc = tqdm(total=total_encoding_frames, desc="encoding", position=1, ascii=' ⡀⡄⡆⡇⡏⡟⡿⣿')
     if args.output_video_name is None:
         video_path_wo_ext, ext = os.path.splitext(args.input_video_name)
         ext = ext[1:]
@@ -86,7 +78,7 @@ def writting_frames():
                           '-map 0 -map -0:v -map 1:v '
                           f'-c:v libx265 -x265-params "{x265_params}" -preset medium '
                           f'-pix_fmt yuv420p10le -crf 23 {args.output_video_name}')
-    output_pipe = sp.Popen(command, stdin=sp.PIPE, stderr=sp.DEVNULL, pipesize=1048576)
+    output_pipe = sp.Popen(command, stdin=sp.PIPE, stderr=sp.DEVNULL)
     while True:
         item = write_buffer.get()
         if item is None:
@@ -145,8 +137,8 @@ model.load_model("train_log", -1)
 model.eval()
 model.device()
 
-pbar = tqdm(total=total_frames, desc="interpol", position=0)
-raw_data = read_buffer.get()
+pbar = tqdm(total=total_frames, desc="interpol", position=0, ascii=' ⡀⡄⡆⡇⡏⡟⡿⣿')
+raw_data = read_raw()
 write_buffer.put(raw_data)
 pbar.update()
 
@@ -160,7 +152,7 @@ I1 = pad_image(I1)
 temp = None  # save last_frame when processing static frame
 
 while True:
-    raw_data = read_buffer.get()
+    raw_data = read_raw()
     if raw_data is None:
         break
     I0 = I1
@@ -176,4 +168,6 @@ while True:
     pbar.update()
 
 # notify about finish of interpolation process
+input_pipe.stdout.close()
 write_buffer.put(None)
+input_pipe.wait()
